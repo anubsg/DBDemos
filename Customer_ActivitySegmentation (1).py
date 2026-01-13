@@ -29,7 +29,7 @@ from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_har
 # MAGIC %sh
 # MAGIC rm -r /dbfs/tmp/dff/
 # MAGIC mkdir -p /dbfs/tmp/dff/
-# MAGIC cp bank_transactions_1.csv /dbfs/tmp/dff/bank_transactions_1.csv
+# MAGIC cp bank_transactions.csv /dbfs/tmp/dff/bank_transactions.csv
 
 # COMMAND ----------
 
@@ -39,7 +39,7 @@ raw_data_path = "/tmp/dff/delta_txns"
 spark.read.option("inferSchema", "true") \
           .option("header", "true") \
           .option("delim", ",") \
-          .csv("dbfs:/tmp/dff/bank_transactions_1.csv") \
+          .csv("dbfs:/tmp/dff/bank_transactions.csv") \
           .write \
           .format("delta") \
           .mode("overwrite") \
@@ -84,3 +84,82 @@ conda_env['dependencies'][2]['pip'] += [f'scikit-learn=={sklearn.__version__}']
 
 # COMMAND ----------
 
+import mlflow
+import mlflow.pyfunc
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.datasets import make_blobs
+import numpy as np
+import tempfile
+import os
+
+# -----------------------------
+# Step 1: Define the PyFunc wrapper
+# -----------------------------
+class KMeansPyFuncModel(mlflow.pyfunc.PythonModel):
+    def load_context(self, context):
+        """
+        Called when loading the model. You can load artifacts here if needed.
+        """
+        import joblib
+        model_path = context.artifacts["kmeans_model"]
+        self.kmeans_model = joblib.load(model_path)
+
+    def predict(self, context, model_input):
+        """
+        model_input: Pandas DataFrame or numpy array
+        Returns: cluster labels
+        """
+        if isinstance(model_input, pd.DataFrame):
+            data = model_input.values
+        elif isinstance(model_input, np.ndarray):
+            data = model_input
+        else:
+            raise TypeError("Input must be a pandas DataFrame or numpy array.")
+
+        return self.kmeans_model.predict(data)
+
+# -----------------------------
+# Step 2: Train a KMeans model
+# -----------------------------
+X, _ = make_blobs(n_samples=200, centers=3, n_features=2, random_state=42)
+kmeans = KMeans(n_clusters=3, random_state=42)
+kmeans.fit(X)
+
+# -----------------------------
+# Step 3: Save the trained model as an artifact
+# -----------------------------
+import joblib
+artifact_dir = tempfile.mkdtemp()
+model_path = os.path.join(artifact_dir, "kmeans_model.pkl")
+joblib.dump(kmeans, model_path)
+
+# -----------------------------
+# Step 4: Log the PyFunc model to MLflow
+# -----------------------------
+with mlflow.start_run() as run:
+    mlflow.pyfunc.log_model(
+        artifact_path="kmeans_pyfunc",
+        python_model=KMeansPyFuncModel(),
+        artifacts={"kmeans_model": model_path},
+        conda_env=mlflow.pyfunc.get_default_conda_env()
+    )
+    run_id = run.info.run_id
+
+print(f"Model logged in run {run_id}")
+
+# -----------------------------
+# Step 5: Load the model back and test prediction
+# -----------------------------
+logged_model_uri = f"runs:/{run_id}/kmeans_pyfunc"
+
+# Load model
+loaded_model = mlflow.pyfunc.load_model(logged_model_uri)
+
+# Predict
+#sample_data = pd.DataFrame(X[:5], columns=["feature1", "feature2"])
+mlflow.log_param('Input-data-location', raw_data_path)
+
+predictions = loaded_model.predict(X)
+
+print("Sample Predictions:", predictions)
